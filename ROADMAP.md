@@ -1,0 +1,16 @@
+# SpillJoin roadmap
+
+## Milestones
+
+- [ ] Implement a streaming in-memory build and probe CLI with duplicate-key joins, correct CSV behavior, atomic output and deterministic error tests.
+- [ ] Add disk-backed hash partitions with working-set accounting and scratch quotas. Compare forced-spill output against the in-memory path and seeded reference joins.
+- [ ] Bound repartitioning and implement chunk-and-rescan for hot keys. Verify skew, scratch exhaustion, I/O failure, cleanup and exact many-to-many results.
+- [ ] Publish a reproducible demo, measured benchmarks, architecture and limitations documentation, and a validated v1.0.0 release.
+
+## Release criteria
+
+- Complete every milestone with deterministic offline tests and a green required GitHub Actions check.
+- Verify complete output multisets against a seeded oracle, including skew and duplicates, plus scratch cleanup on tested failures.
+- Run the dependency-free demo from a fresh checkout and show forced spill and the skew fallback.
+- Publish measured wall time, peak RSS, scratch I/O and row counts. Resolve all release-blocking defects.
+- Validate the merged tree and publish v1.0.0 through the controller.
