@@ -1,9 +1,16 @@
 # SpillJoin
 
-Join unsorted CSV files with a bounded build working set and disk-backed partitions.
+SpillJoin joins two unsorted UTF-8 CSV files on named columns. It builds a hash table from one input and streams the other. Disk-backed partitions are the next milestone.
 
-Build a Python 3.9+ standard-library CLI for an inner equijoin on named string keys in two unsorted UTF-8 CSV inputs. Preserve duplicate-key multiplicity, stream output, and implement disk-backed hash partitioning and a bounded fallback for skew. Emit operator metrics and document reproducible memory, I/O and throughput measurements. Support macOS and Linux. Leave SQL, outer joins and parallel execution outside v1.0.
+From a checkout with Python 3.9 or later:
 
-Run `python3 -m spilljoin --version` from a checkout. See [ROADMAP.md](ROADMAP.md) for implementation milestones.
+```sh
+python3 -m spilljoin events.csv accounts.csv --left-key account_id --right-key id -o joined.csv
+python3 -B -m unittest discover -s tests -v
+```
 
-Run the suite with `python3 -B -m unittest discover -s tests -v`.
+Both inputs need headers with unique names. Keys compare as strings, including empty keys and leading zeros. Duplicate keys produce every matching pair. The output includes both keys and qualifies columns with `left.` or `right.`. Row order is unspecified.
+
+The command picks the build side by input file size and stops when the estimated retained build state exceeds `--build-limit-mib`, which defaults to 64. The estimate covers retained rows and index overhead. Python's runtime and transient CSV buffers also consume memory. A successful run creates a new output file. Existing paths are preserved, and parse failures discard the temporary output.
+
+See [ROADMAP.md](ROADMAP.md) for the planned spill, skew and benchmark work.

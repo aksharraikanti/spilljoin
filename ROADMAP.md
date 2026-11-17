@@ -2,7 +2,7 @@
 
 ## Milestones
 
-- [ ] Implement a streaming in-memory build and probe CLI with duplicate-key joins, correct CSV behavior, atomic output and deterministic error tests.
+- [x] Implement a streaming in-memory build and probe CLI with duplicate-key joins, correct CSV behavior, atomic output and deterministic error tests.
 - [ ] Add disk-backed hash partitions with working-set accounting and scratch quotas. Compare forced-spill output against the in-memory path and seeded reference joins.
 - [ ] Bound repartitioning and implement chunk-and-rescan for hot keys. Verify skew, scratch exhaustion, I/O failure, cleanup and exact many-to-many results.
 - [ ] Publish a reproducible demo, measured benchmarks, architecture and limitations documentation, and a validated v1.0.0 release.
