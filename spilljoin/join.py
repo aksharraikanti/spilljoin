@@ -11,6 +11,7 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 
 PARTITION_COUNT = 64
+MAX_REPARTITION_DEPTH = 2
 
 
 class JoinError(ValueError):
@@ -62,9 +63,11 @@ class ScratchSpace:
         self.root = Path(root)
         self.limit = limit
         self.written = 0
+        self.sequence = 0
 
-    def partition(self, rows, key, side):
-        paths = [self.root / f'{side}-{number}.csv' for number in range(PARTITION_COUNT)]
+    def partition(self, rows, key, side, depth=0):
+        self.sequence += 1
+        paths = [self.root / f'{self.sequence}-{side}-{number}.csv' for number in range(PARTITION_COUNT)]
         with ExitStack() as stack:
             streams = [stack.enter_context(path.open('wb')) for path in paths]
             with StringIO(newline='') as buffer:
@@ -76,11 +79,79 @@ class ScratchSpace:
                     encoded = buffer.getvalue().encode('utf-8')
                     if len(encoded) > self.limit - self.written:
                         raise JoinError('scratch quota exceeded')
-                    digest = hashlib.blake2b(row[key].encode('utf-8'), digest_size=8).digest()
+                    digest = hashlib.blake2b(bytes([depth]) + row[key].encode('utf-8'), digest_size=8).digest()
                     bucket = int.from_bytes(digest, 'big') % PARTITION_COUNT
                     streams[bucket].write(encoded)
                     self.written += len(encoded)
         return paths
+
+
+def _partition_file(scratch, path, key, side, depth):
+    with path.open(encoding='utf-8', newline='') as stream:
+        return scratch.partition(csv.reader(stream, strict=True), key, side, depth)
+
+
+def _probe_file(writer, path, key, index, build_is_left):
+    with path.open(encoding='utf-8', newline='') as stream:
+        return _probe(writer, csv.reader(stream, strict=True), key, index, build_is_left)
+
+
+def _chunk_join(writer, build_path, probe_path, build_key, probe_key,
+                build_is_left, build_limit):
+    # One bounded build chunk at a time; rescan the probe for every chunk.
+    count = 0
+    index = {}
+    retained = 0
+    with build_path.open(encoding='utf-8', newline='') as stream:
+        for row in csv.reader(stream, strict=True):
+            size = _row_size(row)
+            if size > build_limit:
+                raise JoinError('single build row exceeds the build limit')
+            if retained + size > build_limit:
+                count += _probe_file(writer, probe_path, probe_key, index, build_is_left)
+                index.clear()
+                retained = 0
+            index.setdefault(row[build_key], []).append(row)
+            retained += size
+    if index:
+        count += _probe_file(writer, probe_path, probe_key, index, build_is_left)
+    return count
+
+
+def _join_partition(writer, scratch, build_path, probe_path, build_key, probe_key,
+                    build_is_left, build_limit, depth):
+    index = {}
+    retained = 0
+    oversized = False
+    with build_path.open(encoding='utf-8', newline='') as stream:
+        for row in csv.reader(stream, strict=True):
+            size = _row_size(row)
+            if size > build_limit:
+                raise JoinError('single build row exceeds the build limit')
+            if retained + size > build_limit:
+                oversized = True
+                break
+            index.setdefault(row[build_key], []).append(row)
+            retained += size
+    if not oversized:
+        return _probe_file(writer, probe_path, probe_key, index, build_is_left)
+    index.clear()
+    if depth == MAX_REPARTITION_DEPTH:
+        return _chunk_join(writer, build_path, probe_path, build_key, probe_key,
+                           build_is_left, build_limit)
+    next_depth = depth + 1
+    build_paths = _partition_file(scratch, build_path, build_key, 'build', next_depth)
+    probe_paths = _partition_file(scratch, probe_path, probe_key, 'probe', next_depth)
+    # Quota is cumulative bytes written, so deletion never refunds it.
+    build_path.unlink()
+    probe_path.unlink()
+    count = 0
+    for child_build, child_probe in zip(build_paths, probe_paths):
+        count += _join_partition(writer, scratch, child_build, child_probe,
+                                 build_key, probe_key, build_is_left, build_limit, next_depth)
+        child_build.unlink(missing_ok=True)
+        child_probe.unlink(missing_ok=True)
+    return count
 
 
 def _spill_join(writer, build_rows, build_key, probe_rows, probe_key, build_is_left,
@@ -91,18 +162,10 @@ def _spill_join(writer, build_rows, build_key, probe_rows, probe_key, build_is_l
         probe_paths = scratch.partition(probe_rows, probe_key, 'probe')
         count = 0
         for build_path, probe_path in zip(build_paths, probe_paths):
-            index = {}
-            retained = 0
-            with build_path.open(encoding='utf-8', newline='') as stream:
-                for row in csv.reader(stream, strict=True):
-                    retained += _row_size(row)
-                    if retained > build_limit:
-                        raise JoinError('partition working set exceeds the build limit; skew fallback is pending')
-                    index.setdefault(row[build_key], []).append(row)
-            with probe_path.open(encoding='utf-8', newline='') as stream:
-                count += _probe(writer, csv.reader(stream, strict=True), probe_key, index, build_is_left)
-            # Release the last partition before allocating the next index.
-            index.clear()
+            count += _join_partition(writer, scratch, build_path, probe_path, build_key,
+                                     probe_key, build_is_left, build_limit, 0)
+            build_path.unlink(missing_ok=True)
+            probe_path.unlink(missing_ok=True)
         return count
 
 

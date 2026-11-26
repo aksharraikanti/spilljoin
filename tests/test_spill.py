@@ -83,11 +83,97 @@ class SpillJoinTests(unittest.TestCase):
         self.assertEqual(self.read(), Counter([left[0] + right[0]]))
         self.assert_clean()
 
-    def test_oversized_partition_preserves_output_and_cleans_scratch(self):
-        self.write(self.left, [('id', 'value'), *[('hot', str(i)) for i in range(40)]])
-        self.write(self.right, [('value', 'code'), *[('larger payload', 'hot') for _ in range(40)]])
-        with self.assertRaisesRegex(JoinError, 'partition working set exceeds'):
-            self.join(build_limit=1500)
+    def test_hot_key_fallback_preserves_every_duplicate_pair(self):
+        for orientation in ('left', 'right'):
+            with self.subTest(orientation=orientation):
+                left = [('hot', str(i) + ('X' * 30 if orientation == 'right' else ''))
+                        for i in range(40)]
+                right = [('larger payload' + str(i), 'hot') for i in range(40)]
+                self.write(self.left, [('id', 'value'), *left])
+                self.write(self.right, [('value', 'code'), *right])
+                expected = Counter(a + b for a in left for b in right)
+                partition = ScratchSpace.partition
+                with patch.object(ScratchSpace, 'partition', autospec=True,
+                                  side_effect=partition) as calls:
+                    self.assertEqual(self.join(build_limit=1500), 1600)
+                self.assertEqual(calls.call_count, 6)
+                self.assertEqual(self.read(), expected)
+                self.assert_clean()
+                self.output.unlink()
+
+    def test_repartition_splits_collisions_without_chunk_fallback(self):
+        import hashlib
+        keys = []
+        second_buckets = set()
+        for number in range(10000):
+            key = str(number)
+            buckets = [int.from_bytes(hashlib.blake2b(bytes([depth]) + key.encode(),
+                                                     digest_size=8).digest(), 'big') % 64
+                       for depth in (0, 1)]
+            if buckets[0] == 0 and buckets[1] not in second_buckets:
+                keys.append(key)
+                second_buckets.add(buckets[1])
+                if len(keys) == 8:
+                    break
+        self.assertEqual(len(keys), 8)
+        left = [(key, 'value') for key in keys]
+        right = [('longer payload', key) for key in keys]
+        self.write(self.left, [('id', 'value'), *left])
+        self.write(self.right, [('value', 'code'), *right])
+        with patch('spilljoin.join._chunk_join', side_effect=AssertionError('unexpected fallback')):
+            self.assertEqual(self.join(build_limit=1000), len(keys))
+        self.assertEqual(self.read(), Counter(a + b for a in left for b in right if a[0] == b[1]))
+        self.assert_clean()
+
+    def test_single_build_row_over_budget_is_atomic(self):
+        self.write(self.left, [('id', 'value'), ('A', 'value')])
+        self.write(self.right, [('value', 'code'), ('longer payload', 'A')])
+        with self.assertRaisesRegex(JoinError, 'single build row exceeds'):
+            self.join(build_limit=1)
+        self.assertFalse(self.output.exists())
+        self.assert_clean()
+
+    def test_repartition_quota_exhaustion_is_atomic(self):
+        left = [('hot', str(i)) for i in range(20)]
+        right = [('larger payload', 'hot') for _ in range(20)]
+        self.write(self.left, [('id', 'value'), *left])
+        self.write(self.right, [('value', 'code'), *right])
+        with StringIO(newline='') as buffer:
+            csv.writer(buffer).writerows(left + right)
+            initial_bytes = len(buffer.getvalue().encode('utf-8'))
+        with self.assertRaisesRegex(JoinError, 'scratch quota exceeded'):
+            self.join(build_limit=1500, scratch_limit=initial_bytes)
+        self.assertFalse(self.output.exists())
+        self.assert_clean()
+
+    def test_seeded_small_budget_matches_full_oracle(self):
+        rng = random.Random(8347)
+        left = [(rng.choice(['hot', '', 'é', 'a', 'b']), f'l{i}') for i in range(55)]
+        right = [(f'right{i}', rng.choice(['hot', '', 'é', 'a', 'b'])) for i in range(70)]
+        self.write(self.left, [('id', 'value'), *left])
+        self.write(self.right, [('value', 'code'), *right])
+        expected = Counter(a + b for a in left for b in right if a[0] == b[1])
+        self.assertEqual(self.join(build_limit=1000), sum(expected.values()))
+        self.assertEqual(self.read(), expected)
+        self.assert_clean()
+
+    def test_fallback_probe_read_failure_cleans_everything(self):
+        self.write(self.left, [('id', 'value'), *[('hot', str(i)) for i in range(20)]])
+        self.write(self.right, [('value', 'code'), *[('long payload', 'hot') for _ in range(20)]])
+        from spilljoin import join as module
+        original_probe = module._probe_file
+        failed = []
+
+        def fail_probe(writer, path, key, index, build_is_left):
+            if index:
+                failed.append(True)
+                raise OSError('injected fallback read failure')
+            return original_probe(writer, path, key, index, build_is_left)
+
+        with patch.object(module, '_probe_file', side_effect=fail_probe):
+            with self.assertRaisesRegex(OSError, 'injected fallback read failure'):
+                self.join(build_limit=1500)
+        self.assertTrue(failed)
         self.assertFalse(self.output.exists())
         self.assert_clean()
 
