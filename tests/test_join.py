@@ -66,7 +66,7 @@ class CsvJoinTests(unittest.TestCase):
     def test_small_build_budget_stops_before_publication(self):
         self.write(self.left, [('id',), ('A',)])
         self.write(self.right, [('code',), ('A',)])
-        with self.assertRaisesRegex(JoinError, 'working set exceeds'):
+        with self.assertRaisesRegex(JoinError, 'single build row exceeds'):
             self.join(build_limit=1)
         self.assertFalse(self.output.exists())
 
