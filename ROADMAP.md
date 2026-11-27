@@ -31,3 +31,20 @@
 - A seeded small-budget oracle covers multiple oversized keys, empty keys, Unicode and complete output multiplicities.
 - Failures cover a single build row larger than the budget, quota exhaustion during repartitioning and an injected fallback probe-read error. Each checks that no output or scratch files survive.
 - Existing tests retain malformed-input, scratch-write, atomic publication and encoded quota-boundary coverage.
+
+## Milestone 4 progress
+
+- Success-only JSON metrics expose output rows, build choice, spill, cumulative
+  encoded scratch writes, repartitions, fallback partitions, probe scans,
+  estimated retained peak and elapsed join time. Regression tests cover both
+  build orientations, automatic and forced spill, CSV byte accounting, hot-key
+  counters, error behavior and CLI output.
+- A dependency-free demo generates deterministic memory, forced-spill and skew
+  cases. Fresh workers report peak RSS and join metrics; complete output
+  multisets and cleanup are verified after measurement. The offline suite
+  executes this entry point.
+- Architecture and benchmark protocol document costs, atomicity, memory and
+  measurement limits. No measured benchmark results or release are claimed.
+- Remaining: scratch-read byte accounting, representative streaming benchmark
+  workloads, retained raw measurements with interpretation, final release
+  evidence review and controller validation/tagging of v1.0.0.

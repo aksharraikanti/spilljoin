@@ -29,3 +29,22 @@ python3 -m spilljoin events.csv accounts.csv --left-key account_id --right-key i
 A successful run creates a new output file. Existing paths are preserved, and parse, quota and partition-budget failures discard the temporary output. Publication uses a same-directory hard link that refuses an overwrite, including when another process creates the destination during the join. The output file system must support hard links.
 
 See [ROADMAP.md](ROADMAP.md) for milestone progress and release criteria.
+
+## Metrics and reproducible demo
+
+Add --metrics to a join command to emit one JSON success record on stderr.
+The CSV output and Python API row-count return value are unchanged. Counters
+include chosen build side, spill use, output rows, scratch bytes written,
+repartition and fallback counts, probe scans, peak estimated retained state,
+and elapsed join seconds. Failed commands emit an error without success metrics.
+
+```sh
+python3 -B -m spilljoin.demo
+python3 -B -m spilljoin.demo --rows 256 --repeats 5 > demo-results.json
+```
+
+The demo generates inputs, verifies complete output multisets and exercises
+memory, forced spill and hot-key fallback in fresh workers. It needs no packages
+or input downloads. See [BENCHMARKS.md](BENCHMARKS.md) for measurement semantics
+and remaining release evidence, and [ARCHITECTURE.md](ARCHITECTURE.md) for the
+algorithm, metrics contract, complexity and operational limits.
