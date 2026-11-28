@@ -2,16 +2,31 @@
 
 from contextlib import ExitStack
 import csv
+from dataclasses import asdict, dataclass
 import hashlib
 from io import StringIO
 from itertools import chain
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+from time import perf_counter
 
 
 PARTITION_COUNT = 64
 MAX_REPARTITION_DEPTH = 2
+
+
+@dataclass
+class JoinMetrics:
+    output_rows: int = 0
+    build_side: str = ''
+    spilled: bool = False
+    scratch_written_bytes: int = 0
+    repartition_passes: int = 0
+    fallback_partitions: int = 0
+    probe_passes: int = 0
+    retained_peak_bytes: int = 0
+    elapsed_seconds: float = 0.0
 
 
 class JoinError(ValueError):
@@ -59,11 +74,12 @@ def _probe(writer, rows, key, index, build_is_left):
 
 
 class ScratchSpace:
-    def __init__(self, root, limit):
+    def __init__(self, root, limit, metrics=None):
         self.root = Path(root)
         self.limit = limit
         self.written = 0
         self.sequence = 0
+        self.metrics = metrics if metrics is not None else JoinMetrics()
 
     def partition(self, rows, key, side, depth=0):
         self.sequence += 1
@@ -83,6 +99,7 @@ class ScratchSpace:
                     bucket = int.from_bytes(digest, 'big') % PARTITION_COUNT
                     streams[bucket].write(encoded)
                     self.written += len(encoded)
+                    self.metrics.scratch_written_bytes += len(encoded)
         return paths
 
 
@@ -97,8 +114,9 @@ def _probe_file(writer, path, key, index, build_is_left):
 
 
 def _chunk_join(writer, build_path, probe_path, build_key, probe_key,
-                build_is_left, build_limit):
+                build_is_left, build_limit, metrics):
     # One bounded build chunk at a time; rescan the probe for every chunk.
+    metrics.fallback_partitions += 1
     count = 0
     index = {}
     retained = 0
@@ -108,18 +126,22 @@ def _chunk_join(writer, build_path, probe_path, build_key, probe_key,
             if size > build_limit:
                 raise JoinError('single build row exceeds the build limit')
             if retained + size > build_limit:
+                metrics.probe_passes += 1
                 count += _probe_file(writer, probe_path, probe_key, index, build_is_left)
                 index.clear()
                 retained = 0
             index.setdefault(row[build_key], []).append(row)
             retained += size
+            metrics.retained_peak_bytes = max(metrics.retained_peak_bytes, retained)
     if index:
+        metrics.probe_passes += 1
         count += _probe_file(writer, probe_path, probe_key, index, build_is_left)
     return count
 
 
 def _join_partition(writer, scratch, build_path, probe_path, build_key, probe_key,
                     build_is_left, build_limit, depth):
+    metrics = scratch.metrics
     index = {}
     retained = 0
     oversized = False
@@ -133,12 +155,15 @@ def _join_partition(writer, scratch, build_path, probe_path, build_key, probe_ke
                 break
             index.setdefault(row[build_key], []).append(row)
             retained += size
+            metrics.retained_peak_bytes = max(metrics.retained_peak_bytes, retained)
     if not oversized:
+        metrics.probe_passes += 1
         return _probe_file(writer, probe_path, probe_key, index, build_is_left)
     index.clear()
     if depth == MAX_REPARTITION_DEPTH:
         return _chunk_join(writer, build_path, probe_path, build_key, probe_key,
-                           build_is_left, build_limit)
+                           build_is_left, build_limit, metrics)
+    metrics.repartition_passes += 1
     next_depth = depth + 1
     build_paths = _partition_file(scratch, build_path, build_key, 'build', next_depth)
     probe_paths = _partition_file(scratch, probe_path, probe_key, 'probe', next_depth)
@@ -155,9 +180,10 @@ def _join_partition(writer, scratch, build_path, probe_path, build_key, probe_ke
 
 
 def _spill_join(writer, build_rows, build_key, probe_rows, probe_key, build_is_left,
-                build_limit, scratch_limit, scratch_dir):
+                build_limit, scratch_limit, scratch_dir, metrics):
+    metrics.spilled = True
     with TemporaryDirectory(prefix='.spilljoin-', dir=scratch_dir) as directory:
-        scratch = ScratchSpace(directory, scratch_limit)
+        scratch = ScratchSpace(directory, scratch_limit, metrics)
         build_paths = scratch.partition(build_rows, build_key, 'build')
         probe_paths = scratch.partition(probe_rows, probe_key, 'probe')
         count = 0
@@ -171,8 +197,10 @@ def _spill_join(writer, build_rows, build_key, probe_rows, probe_key, build_is_l
 
 def join_csv(left_path, right_path, output_path, left_key, right_key, *,
              build_limit=64 * 1024 * 1024, scratch_limit=1024 * 1024 * 1024,
-             scratch_dir=None, force_spill=False):
-    """Write a new CSV and return the joined row count. Limits are in bytes."""
+             scratch_dir=None, force_spill=False, metrics=None):
+    """Return joined row count; update an optional metrics dict only on success."""
+    started = perf_counter()
+    stats = JoinMetrics()
     if build_limit < 1:
         raise JoinError('build limit must be positive')
     if scratch_limit < 1:
@@ -188,6 +216,7 @@ def join_csv(left_path, right_path, output_path, left_key, right_key, *,
             right = CsvInput(right_stream, 'right', right_key)
             build, probe = (left, right) if os.fstat(left_stream.fileno()).st_size <= os.fstat(
                 right_stream.fileno()).st_size else (right, left)
+            stats.build_side = 'left' if build is left else 'right'
             with NamedTemporaryFile(mode='w', encoding='utf-8', newline='', dir=output_path.parent,
                                     prefix='.spilljoin-', delete=False) as stream:
                 staging = stream.name
@@ -199,20 +228,26 @@ def join_csv(left_path, right_path, output_path, left_key, right_key, *,
                 retained = 0
                 if force_spill:
                     count = _spill_join(writer, build_rows, build.key, probe, probe.key, build is left,
-                                        build_limit, scratch_limit, scratch_dir)
+                                        build_limit, scratch_limit, scratch_dir, stats)
                 else:
                     for row in build_rows:
                         retained += _row_size(row)
                         if retained > build_limit:
                             pending_rows = chain(_drain_index(index), (row,), build_rows)
                             count = _spill_join(writer, pending_rows, build.key, probe, probe.key,
-                                                build is left, build_limit, scratch_limit, scratch_dir)
+                                                build is left, build_limit, scratch_limit, scratch_dir, stats)
                             break
                         index.setdefault(row[build.key], []).append(row)
+                        stats.retained_peak_bytes = max(stats.retained_peak_bytes, retained)
                     else:
+                        stats.probe_passes += 1
                         count = _probe(writer, probe, probe.key, index, build is left)
             # A same-directory hard link publishes atomically and refuses a racing overwrite.
             os.link(staging, output_path)
+            stats.output_rows = count
+            stats.elapsed_seconds = perf_counter() - started
+            if metrics is not None:
+                metrics.update(asdict(stats))
             return count
     finally:
         if staging is not None:

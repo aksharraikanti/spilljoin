@@ -2,6 +2,8 @@
 
 import argparse
 import csv
+import json
+import sys
 
 from . import __version__
 from .join import JoinError, join_csv
@@ -19,14 +21,19 @@ def main():
     parser.add_argument('--scratch-limit-mib', type=int, default=1024)
     parser.add_argument('--scratch-dir', help='parent directory for temporary partitions')
     parser.add_argument('--force-spill', action='store_true', help='partition even when the build fits in memory')
+    parser.add_argument('--metrics', action='store_true', help='emit success metrics as JSON on stderr')
     args = parser.parse_args()
+    metrics = {}
     try:
         join_csv(args.left, args.right, args.output, args.left_key, args.right_key,
                  build_limit=args.build_limit_mib * 1024 * 1024,
                  scratch_limit=args.scratch_limit_mib * 1024 * 1024,
-                 scratch_dir=args.scratch_dir, force_spill=args.force_spill)
+                 scratch_dir=args.scratch_dir, force_spill=args.force_spill, metrics=metrics)
     except (JoinError, OSError, UnicodeError, csv.Error) as error:
         parser.exit(1, f'spilljoin: {error}\n')
+
+    if args.metrics:
+        print(json.dumps(metrics, sort_keys=True), file=sys.stderr)
 
 
 if __name__ == '__main__':
